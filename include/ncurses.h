@@ -28,6 +28,11 @@
 #define COLOR_MAGENTA 5
 #define COLOR_CYAN 6
 
+#define KEY_LEFT 260
+#define KEY_RIGHT 261
+#define KEY_UP 258
+#define KEY_DOWN 259
+
 int start_color(void);
 int init_pair(short pair, short f, short b);
 
@@ -47,12 +52,19 @@ int curs_set(int visibility);
 int nodelay(WINDOW *win, int bf);
 int getch(void);
 int mvaddch(int y, int x, const char ch);
+int mvwaddch(WINDOW *win, int y, int x, const char ch);
+int mvwprintw(WINDOW *win, int y, int x, const char *fmt, ...);
 int attron(int attr);
 int attroff(int attr);
 void refresh(void);
 int napms(int ms);
 int endwin(void);
+WINDOW *newwin(int nlines, int ncols, int begin_y, int begin_x);
+int box(WINDOW *win, int verch, int horch);
+int wrefresh(WINDOW *win);
 
 int COLOR_PAIR(int color);
+
+int keypad(WINDOW *win, int bf);
 
 extern WINDOW *stdscr;

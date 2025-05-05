@@ -18,6 +18,7 @@
 #include "include/ncurses.h"
 
 #include <fcntl.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -100,6 +101,32 @@ int nodelay(WINDOW *win, int bf) {
 int getch(void) {
   int ch = 0;
   read(STDIN_FILENO, &ch, 1);
+  if (ch == 0x1B) {
+    char seq = 0;
+    while (read(STDIN_FILENO, &seq, 1) == 0) {
+    }
+    if (seq != '[') {
+      return ch;
+    }
+    seq = 0;
+    while (read(STDIN_FILENO, &seq, 1) == 0) {
+      read(STDIN_FILENO, &seq, 1);
+    }
+    switch (seq) {
+    case 'A':
+      ch = KEY_UP;
+      break;
+    case 'B':
+      ch = KEY_DOWN;
+      break;
+    case 'C':
+      ch = KEY_RIGHT;
+      break;
+    case 'D':
+      ch = KEY_LEFT;
+      break;
+    }
+  }
   return ch;
 }
 
@@ -128,6 +155,10 @@ void refresh(void) {
 }
 
 int napms(int ms) {
+  return 0;
+}
+
+int keypad(WINDOW *win, int bf) {
   return 0;
 }
 
@@ -166,4 +197,42 @@ WINDOW *initscr(void) {
   fflush(stdout);
 
   return &default_window;
+}
+
+WINDOW *newwin(int nlines, int ncols, int begin_y, int begin_x) {
+  WINDOW *win = malloc(sizeof(WINDOW));
+  win->x = ncols;
+  win->y = nlines;
+  return win;
+}
+
+int box(WINDOW *win, int verch, int horch) {
+  for (int i = 0; i < win->x; i++) {
+    mvaddch(win->y - 1, i, horch);
+    mvaddch(0, i, horch);
+  }
+  for (int i = 0; i < win->y; i++) {
+    mvaddch(i, 0, verch);
+    mvaddch(i, win->x - 1, verch);
+  }
+  return 0;
+}
+
+int wrefresh(WINDOW *win) {
+  fflush(stdout);
+  return 0;
+}
+
+int mvwaddch(WINDOW *win, int y, int x, const char ch) {
+  printf("\033[%d;%dH%c", y, x, ch);
+  return 0;
+}
+
+int mvwprintw(WINDOW *win, int y, int x, const char *fmt, ...) {
+  va_list args;
+  va_start(args, fmt);
+  printf("\033[%d;%dH", y, x);
+  vfprintf(stdout, fmt, args);
+  va_end(args);
+  return 0;
 }
