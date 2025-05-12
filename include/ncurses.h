@@ -56,6 +56,8 @@ int mvwaddch(WINDOW *win, int y, int x, const char ch);
 int mvwprintw(WINDOW *win, int y, int x, const char *fmt, ...);
 int attron(int attr);
 int attroff(int attr);
+int wattron(WINDOW *win, int attr);
+int wattroff(WINDOW *win, int attr);
 void refresh(void);
 int napms(int ms);
 int endwin(void);

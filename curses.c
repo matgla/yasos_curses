@@ -155,6 +155,11 @@ void refresh(void) {
 }
 
 int napms(int ms) {
+  // temporary implementation
+  for (int i = 0; i < ms; ++i) {
+    for (int j = 0; j < 10000; ++j) {
+    }
+  }
   return 0;
 }
 
@@ -214,6 +219,23 @@ int box(WINDOW *win, int verch, int horch) {
   for (int i = 0; i < win->y; i++) {
     mvaddch(i, 0, verch);
     mvaddch(i, win->x - 1, verch);
+  }
+  return 0;
+}
+
+int wattron(WINDOW *win, int attr) {
+  if (attr & COLOR_ATTRIUTE) {
+    int fg = ((attr >> 4) & 0xF) + 30;
+    int bg = (attr & 0xF) + 40;
+
+    printf("\033[%d;%dm\n", fg, bg);
+  }
+  return 0;
+}
+
+int wattroff(WINDOW *win, int attr) {
+  if (attr & COLOR_ATTRIUTE) {
+    printf(RESET_STYLE);
   }
   return 0;
 }
