@@ -20,6 +20,8 @@
 
 #pragma once
 
+#include <stdint.h>
+
 #define COLOR_BLACK 0
 #define COLOR_RED 1
 #define COLOR_GREEN 2
@@ -27,18 +29,39 @@
 #define COLOR_BLUE 4
 #define COLOR_MAGENTA 5
 #define COLOR_CYAN 6
+#define COLOR_WHITE 7
 
 #define KEY_LEFT 260
 #define KEY_RIGHT 261
 #define KEY_UP 258
 #define KEY_DOWN 259
+#define KEY_BACKSPACE 263
+
+#define A_NORMAL 0
+#define A_ITALIC (1 << 8)
+#define A_BOLD (1 << 9)
+#define A_BRIGHT (1 << 10)
 
 int start_color(void);
 int init_pair(short pair, short f, short b);
 
 typedef struct {
+  // uint8_t color; // color from pallette
+  // uint8_t bold;
+  // uint8_t italic;
+  uint8_t dirty;
+} Attribute;
+
+typedef char Attribute;
+
+typedef struct {
   int x;
   int y;
+  int cursor_x;
+  int cursor_y;
+  char **lines;
+  Attribute current_attribute;
+  Attribute **attribute_map;
 } WINDOW;
 
 WINDOW *initscr(void);
@@ -46,6 +69,8 @@ WINDOW *initscr(void);
 void getmaxyx_(WINDOW *win, int *y, int *x);
 #define getmaxyx(win, y, x) getmaxyx_(win, &y, &x)
 
+int clear(void);
+int raw(void);
 int cbreak(void);
 int noecho(void);
 int curs_set(int visibility);
@@ -54,6 +79,10 @@ int getch(void);
 int mvaddch(int y, int x, const char ch);
 int mvwaddch(WINDOW *win, int y, int x, const char ch);
 int mvwprintw(WINDOW *win, int y, int x, const char *fmt, ...);
+int mvprintw(int y, int x, const char *fmt, ...);
+int mvaddstr(int y, int x, const char *str);
+int mvaddnstr(int y, int x, const char *str, int n);
+int move(int y, int x);
 int attron(int attr);
 int attroff(int attr);
 int wattron(WINDOW *win, int attr);
