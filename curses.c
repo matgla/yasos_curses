@@ -21,8 +21,10 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include <termios.h>
+#include <unistd.h>
 
 #define CLEAR_SCREEN "\033[2J"
 #define CURSOR_HIDE "\033[?25l"
@@ -35,12 +37,13 @@
 
 WINDOW *stdscr = NULL;
 
-struct termios original_stdout_termios = {};
-struct termios current_stdout_termios = {};
-struct termios original_stdin_termios = {};
-struct termios current_stdin_termios = {};
+struct termios original_stdout_termios;
+struct termios current_stdout_termios;
+struct termios original_stdin_termios;
+struct termios current_stdin_termios;
 
 int original_fcntl_flags = 0;
+int current_fcntl_flags = 0;
 int cursor_enabled = 1;
 
 typedef struct {
@@ -51,7 +54,8 @@ typedef struct {
 ColorPair color_pairs[16] = {0};
 
 static void set_cell_dirty(WINDOW *win, int y, int x) {
-  // win->attribute_map[y][x] = win->current_attribute;
+  win->attribute_map[y][x] = win->current_attribute;
+  win->attribute_map[y][x].dirty = 1;
 }
 
 void getmaxyx_(WINDOW *win, int *y, int *x) {
@@ -105,7 +109,9 @@ int curs_set(int visibility) {
 }
 
 int nodelay(WINDOW *win, int bf) {
-  int current_fcntl_flags = current_fcntl_flags | O_NONBLOCK;
+  (void)win;
+  (void)bf;
+  current_fcntl_flags = current_fcntl_flags | O_NONBLOCK;
   fcntl(STDIN_FILENO, F_SETFL, &current_fcntl_flags);
   return 0;
 }
@@ -154,8 +160,7 @@ int mvwaddch(WINDOW *win, int y, int x, const char ch) {
   win->cursor_y = y + 1;
 
   win->lines[y][x] = ch;
-
-  win->attribute_map[y][x].dirty = 1;
+  set_cell_dirty(win, y, x);
   return 0;
 }
 
@@ -164,6 +169,8 @@ int mvaddch(int y, int x, const char ch) {
 }
 
 int wattron(WINDOW *win, int attr) {
+  (void)win;
+  (void)attr;
   // if (attr & A_ITALIC) {
   //   win->current_attribute.italic = 1;
   // }
@@ -176,6 +183,8 @@ int wattron(WINDOW *win, int attr) {
 }
 
 int wattroff(WINDOW *win, int attr) {
+  (void)win;
+  (void)attr;
   // if (attr & A_ITALIC) {
   //   win->current_attribute.italic = 0;
   // }
@@ -212,6 +221,8 @@ int napms(int ms) {
 }
 
 int keypad(WINDOW *win, int bf) {
+  (void)win;
+  (void)bf;
   return 0;
 }
 
@@ -237,10 +248,12 @@ int endwin(void) {
 }
 
 int COLOR_PAIR(int color) {
-  return COLOR_ATTRIBUTE | color & 0x7f;
+  return COLOR_ATTRIBUTE | (color & 0x7f);
 }
 
 WINDOW *newwin(int nlines, int ncols, int begin_y, int begin_x) {
+  (void)begin_y;
+  (void)begin_x;
   WINDOW *win = malloc(sizeof(WINDOW));
   win->x = ncols;
   win->y = nlines;
@@ -292,8 +305,8 @@ int wrefresh(WINDOW *win) {
   printf(CURSOR_HIDE);
   for (int y = 0; y < win->y; ++y) {
     for (int x = 0; x < win->x; ++x) {
-      if (win->attribute_map[y][x] == 1) {
-        win->attribute_map[y][x] = 0; // Reset modified map
+      if (win->attribute_map[y][x].dirty == 1) {
+        win->attribute_map[y][x].dirty = 0; // Reset modified map
         // if (win->attribute_map[y][x].bold) {
         //   printf("\033[1m");
         // } else {
@@ -335,7 +348,7 @@ static int vmvwprintw(WINDOW *win, int y, int x, const char *fmt,
 
   int changed = vsnprintf(win->lines[y] + x, win->x - x, fmt, args);
   for (int i = 0; i < changed; ++i) {
-    win->attribute_map[y][x + i] = 1;
+    set_cell_dirty(win, y, x + i);
   }
 
   win->cursor_x = x + changed + 1;
@@ -392,8 +405,8 @@ int wclear(WINDOW *win) {
   for (int i = 0; i < win->y; ++i) {
     for (int x = 0; x < win->x; ++x) {
       if (win->lines[i][x] != ' ') {
-        win->lines[i][x] = ' ';       // Clear the character
-        win->attribute_map[i][x] = 1; // Mark the attribute as dirty
+        win->lines[i][x] = ' ';
+        set_cell_dirty(win, i, x);
       }
     }
   }

@@ -52,8 +52,6 @@ typedef struct {
   uint8_t dirty;
 } Attribute;
 
-typedef char Attribute;
-
 typedef struct {
   int x;
   int y;

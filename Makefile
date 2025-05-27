@@ -1,8 +1,13 @@
-CC ?= tcc 
-CFLAGS = -std=c11 -Wall -g -fpic -pedantic -nostdlib -nostdinc -I. -I../../rootfs/usr/include 
-LDFLAGS_STATIC = -g -Wl,-Ttext=0x0 -Wl,-section-alignment=0x4 -L../../rootfs/lib
+CC ?= gcc
+CFLAGS = -std=c11 -Wall -g -fPIC -pedantic -Wextra -Werror
+LDFLAGS_STATIC = -g 
+LDFLAGS = -arch arm64 -dynamiclib -fPIC
 
-LDFLAGS = -shared -fPIC ${LDFLAGS_STATIC} 
+ifeq ($(CC), armv8m-tcc)
+CFLAGS += -I. -I../../rootfs/usr/include -nostdlib -nostdinc 
+LDFLAGS_STATIC += -Wl,-Ttext=0x0 -Wl,-section-alignment=0x4 -L../../rootfs/lib
+endif
+LDFLAGS += ${LDFLAGS_STATIC} 
 
 SRCS = $(wildcard *.c)
 
@@ -24,8 +29,13 @@ prepare:
 build/%.o: %.c prepare
 	$(CC) $(CFLAGS) -c $< -o $@
 
+ifeq ($(CC), armv8m-tcc)
 $(TARGET_SHARED): $(OBJS)
 	$(CC) $(LDFLAGS) -Wl,-oformat=yaff $^ -o $@
+else 
+$(TARGET_SHARED): 
+
+endif 
 
 $(TARGET_SHARED).elf: $(OBJS)
 	$(CC) $(LDFLAGS) $^ -o $@
