@@ -323,10 +323,6 @@ int wrefresh(WINDOW *win) {
         } else {
           printf("\033[39m");
         }
-        if (win->lines[y][x] == '#') {
-          fprintf(stderr, "Drawing character '%c' at %dx%d\n", win->lines[y][x],
-                  y, x);
-        }
         printf("\033[%d;%dH%c", y + 1, x + 1, win->lines[y][x]);
       }
     }
