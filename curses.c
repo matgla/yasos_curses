@@ -169,31 +169,30 @@ int mvaddch(int y, int x, const char ch) {
 }
 
 int wattron(WINDOW *win, int attr) {
-  (void)win;
-  (void)attr;
-  // if (attr & A_ITALIC) {
-  //   win->current_attribute.italic = 1;
-  // }
-  // if (attr & A_BOLD) {
-  //   win->current_attribute.bold = 1;
-  // }
-  // if (attr & COLOR_ATTRIBUTE) {
-  // }
+  if (attr & A_ITALIC) {
+    win->current_attribute.italic = 1;
+  }
+  if (attr & A_BOLD) {
+    win->current_attribute.bold = 1;
+  }
+  if (attr & COLOR_ATTRIBUTE) {
+    win->current_attribute.color = attr & 0x7f; // Store color pair
+    win->current_attribute.color_enabled = 1;
+  }
   return 0;
 }
 
 int wattroff(WINDOW *win, int attr) {
-  (void)win;
-  (void)attr;
-  // if (attr & A_ITALIC) {
-  //   win->current_attribute.italic = 0;
-  // }
-  // if (attr & A_BOLD) {
-  //   win->current_attribute.bold = 0;
-  // }
-  // if (attr & COLOR_ATTRIBUTE) {
-  //   win->current_attribute.color = 0;
-  // }
+  if (attr & A_ITALIC) {
+    win->current_attribute.italic = 0;
+  }
+  if (attr & A_BOLD) {
+    win->current_attribute.bold = 0;
+  }
+  if (attr & COLOR_ATTRIBUTE) {
+    win->current_attribute.color_enabled = 0;
+    win->current_attribute.color = 0;
+  }
 
   return 0;
 }
@@ -226,6 +225,20 @@ int keypad(WINDOW *win, int bf) {
   return 0;
 }
 
+int wendwin(WINDOW *win) {
+  if (win != NULL) {
+    for (int i = 0; i < win->y; ++i) {
+      free(win->lines[i]);
+      free(win->attribute_map[i]);
+    }
+    free(win->lines);
+    free(win->line_buffer);
+    free(win->attribute_map);
+    free(win);
+  }
+  return 0;
+}
+
 int endwin(void) {
   tcsetattr(STDOUT_FILENO, TCSAFLUSH, &original_stdout_termios);
   tcsetattr(STDIN_FILENO, TCSAFLUSH, &original_stdin_termios);
@@ -234,16 +247,8 @@ int endwin(void) {
   printf(CURSOR_SHOW);
   printf(RESET_STYLE);
   fflush(stdout);
-  if (stdscr != NULL) {
-    for (int i = 0; i < stdscr->y; ++i) {
-      free(stdscr->lines[i]);
-      free(stdscr->attribute_map[i]);
-    }
-    free(stdscr->lines);
-    free(stdscr->attribute_map);
-    free(stdscr);
-    stdscr = NULL;
-  }
+  wendwin(stdscr);
+  stdscr = NULL;
   return 0;
 }
 
@@ -257,6 +262,9 @@ WINDOW *newwin(int nlines, int ncols, int begin_y, int begin_x) {
   WINDOW *win = malloc(sizeof(WINDOW));
   win->x = ncols;
   win->y = nlines;
+  win->cursor_x = 1;
+  win->cursor_y = 1;
+  win->line_buffer = malloc(sizeof(char) * (win->x + 1));
   win->lines = malloc(sizeof(char *) * win->y);
   for (int i = 0; i < win->y; ++i) {
     win->lines[i] = malloc(sizeof(char) * (win->x));
@@ -307,25 +315,18 @@ int wrefresh(WINDOW *win) {
     for (int x = 0; x < win->x; ++x) {
       if (win->attribute_map[y][x].dirty == 1) {
         win->attribute_map[y][x].dirty = 0; // Reset modified map
-        // if (win->attribute_map[y][x].bold) {
-        //   printf("\033[1m");
-        // } else {
-        //   printf("\033[22m");
-        // }
-        // if (win->attribute_map[y][x].italic) {
-        //   printf("\033[3m");
-        // } else {
-        //   printf("\033[23m");
-        // }
-        // if (win->attribute_map[y][x].color & COLOR_ATTRIBUTE) {
-        //   const int fg = color_pairs[win->attribute_map[y][x].color &
-        //   0x7f].fg; const int bg = color_pairs[win->attribute_map[y][x].color
-        //   & 0x7f].bg;
+        if (win->attribute_map[y][x].color_enabled) {
+          const int fg = color_pairs[win->attribute_map[y][x].color & 0x7f].fg;
+          const int bg = color_pairs[win->attribute_map[y][x].color & 0x7f].bg;
 
-        //   printf("\033[%d;%dm", fg + 30, bg + 40);
-        // } else {
-        //   printf("\033[39m");
-        // }
+          printf("\033[%d;%dm", fg + 30, bg + 40);
+        } else {
+          printf("\033[39m");
+        }
+        if (win->lines[y][x] == '#') {
+          fprintf(stderr, "Drawing character '%c' at %dx%d\n", win->lines[y][x],
+                  y, x);
+        }
         printf("\033[%d;%dH%c", y + 1, x + 1, win->lines[y][x]);
       }
     }
@@ -333,6 +334,7 @@ int wrefresh(WINDOW *win) {
   }
 
   printf("\033[%d;%dH", win->cursor_y, win->cursor_x);
+  fflush(stdout);
   if (cursor_enabled) {
     printf(CURSOR_SHOW);
   }
@@ -346,15 +348,14 @@ static int vmvwprintw(WINDOW *win, int y, int x, const char *fmt,
     return -1; // Out of bounds
   }
 
-  int changed = vsnprintf(win->lines[y] + x, win->x - x, fmt, args);
+  int changed = vsnprintf(win->line_buffer, win->x - x, fmt, args);
+  memcpy(win->lines[y] + x, win->line_buffer, changed); // without 0 at end
   for (int i = 0; i < changed; ++i) {
     set_cell_dirty(win, y, x + i);
   }
 
   win->cursor_x = x + changed + 1;
   win->cursor_y = y + 1;
-  // printf("\033[%d;%dH", y, x + changed);
-  // fflush(stdout);
   return changed;
 }
 
@@ -375,8 +376,10 @@ int mvprintw(int y, int x, const char *fmt, ...) {
 }
 
 int mvwaddnstr(WINDOW *win, int y, int x, const char *str, int n) {
-  int len = strnlen(str, n);
-  for (int i = 0; i < len; ++i) {
+  for (int i = 0; i < n; ++i) {
+    if (str[i] == '\0') {
+      break; // Stop if we reach the end of the string or the window width
+    }
     mvwaddch(win, y, x + i, str[i]);
   }
   return 0;
@@ -390,23 +393,29 @@ int mvaddstr(int y, int x, const char *str) {
   return mvwaddnstr(stdscr, y, x, str, stdscr->x - x);
 }
 
-int move(int y, int x) {
-  if (y < 0 || y >= stdscr->y || x < 0 || x >= stdscr->x) {
+int wmove(WINDOW *win, int y, int x) {
+  if (y < 0 || y >= win->y || x < 0 || x >= win->x) {
     return -1; // Out of bounds
   }
-  stdscr->cursor_x = x + 1;
-  stdscr->cursor_y = y + 1;
+  win->cursor_x = x + 1;
+  win->cursor_y = y + 1;
+  // printf("\033[%d;%dH", win->cursor_y, win->cursor_x);
+  // fflush(stdout);
   return 0;
+}
+
+int move(int y, int x) {
+  return wmove(stdscr, y, x);
 }
 
 int wclear(WINDOW *win) {
   win->cursor_x = 1;
   win->cursor_y = 1;
-  for (int i = 0; i < win->y; ++i) {
+  for (int y = 0; y < win->y; ++y) {
     for (int x = 0; x < win->x; ++x) {
-      if (win->lines[i][x] != ' ') {
-        win->lines[i][x] = ' ';
-        set_cell_dirty(win, i, x);
+      if (win->lines[y][x] != ' ') {
+        win->lines[y][x] = ' ';
+        set_cell_dirty(win, y, x);
       }
     }
   }

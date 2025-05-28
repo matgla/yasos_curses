@@ -1,27 +1,32 @@
 CC ?= gcc
-CFLAGS = -std=c11 -Wall -g -fPIC -pedantic -Wextra -Werror
+CFLAGS = -std=c11 -Wall -g -fPIC -pedantic -Wextra 
 LDFLAGS_STATIC = -g 
-LDFLAGS = -arch arm64 -dynamiclib -fPIC
+LDFLAGS = -shared -fPIC
 
 ifeq ($(CC), armv8m-tcc)
 CFLAGS += -I. -I../../rootfs/usr/include -nostdlib -nostdinc 
 LDFLAGS_STATIC += -Wl,-Ttext=0x0 -Wl,-section-alignment=0x4 -L../../rootfs/lib
+TARGET_SHARED = build/libncurses.so
+TARGET_SHARED_ELF = build/libncurses.so.elf
+else 
+TARGET_SHARED = build/libncurses_yaff.so
+TARGET_SHARED_ELF = build/libncurses.so
 endif
+
+
 LDFLAGS += ${LDFLAGS_STATIC} 
 
+TARGET_STATIC = build/libncurses.a
 SRCS = $(wildcard *.c)
 
 OBJS = $(patsubst %.c, build/%.o, $(SRCS))
-
-TARGET_SHARED = build/libncurses.so
-TARGET_STATIC = build/libncurses.a
 
 PREFIX ?= /usr/local
 LIBDIR ?= $(PREFIX)/lib
 INCLUDEDIR ?= $(PREFIX)/include
 
 # Rules
-all: $(TARGET_SHARED) $(TARGET_SHARED).elf $(TARGET_STATIC)
+all: $(TARGET_SHARED) $(TARGET_SHARED_ELF) $(TARGET_STATIC)
 
 prepare: 
 	mkdir -p build
@@ -37,13 +42,13 @@ $(TARGET_SHARED):
 
 endif 
 
-$(TARGET_SHARED).elf: $(OBJS)
+$(TARGET_SHARED_ELF): $(OBJS)
 	$(CC) $(LDFLAGS) $^ -o $@
 
 $(TARGET_STATIC): $(OBJS)
 	ar rcs $@ $^
 
-install: $(TARGET_SHARED) $(TARGET_STATIC) $(TARGET_SHARED).elf
+install: $(TARGET_SHARED) $(TARGET_STATIC) $(TARGET_SHARED_ELF)
 	mkdir -p $(LIBDIR)
 	cp $(TARGET_SHARED) $(LIBDIR)
 	cp $(TARGET_STATIC) $(LIBDIR)

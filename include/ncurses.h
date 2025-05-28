@@ -46,10 +46,13 @@ int start_color(void);
 int init_pair(short pair, short f, short b);
 
 typedef struct {
-  // uint8_t color; // color from pallette
+  uint32_t color : 7;
+  uint32_t color_enabled : 1;
+  uint32_t bold : 1;
+  uint32_t italic : 1;
   // uint8_t bold;
   // uint8_t italic;
-  uint8_t dirty;
+  uint32_t dirty : 1;
 } Attribute;
 
 typedef struct {
@@ -58,6 +61,7 @@ typedef struct {
   int cursor_x;
   int cursor_y;
   char **lines;
+  char *line_buffer;
   Attribute current_attribute;
   Attribute **attribute_map;
 } WINDOW;
