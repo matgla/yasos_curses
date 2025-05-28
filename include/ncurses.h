@@ -52,6 +52,7 @@ typedef struct {
   uint32_t italic : 1;
   // uint8_t bold;
   // uint8_t italic;
+  uint32_t clear : 1;
   uint32_t dirty : 1;
 } Attribute;
 
@@ -99,5 +100,8 @@ int wrefresh(WINDOW *win);
 int COLOR_PAIR(int color);
 
 int keypad(WINDOW *win, int bf);
+
+int wclrtoeol(WINDOW *win);
+#define clrtoeol() wclrtoeol(stdscr)
 
 extern WINDOW *stdscr;

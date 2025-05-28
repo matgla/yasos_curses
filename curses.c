@@ -29,6 +29,7 @@
 #define CLEAR_SCREEN "\033[2J"
 #define CURSOR_HIDE "\033[?25l"
 #define CURSOR_SHOW "\033[?25h"
+#define CURSOR_HOME "\033[H"
 #define RESET_STYLE "\033[0m"
 #define CURSOR_SAVE "\0337"
 #define CURSOR_RESTORE "\0338"
@@ -56,6 +57,7 @@ ColorPair color_pairs[16] = {0};
 static void set_cell_dirty(WINDOW *win, int y, int x) {
   win->attribute_map[y][x] = win->current_attribute;
   win->attribute_map[y][x].dirty = 1;
+  win->attribute_map[y][x].clear = 0;
 }
 
 void getmaxyx_(WINDOW *win, int *y, int *x) {
@@ -310,34 +312,41 @@ int box(WINDOW *win, int verch, int horch) {
 }
 
 int wrefresh(WINDOW *win) {
-  printf(CURSOR_HIDE);
+  write(STDOUT_FILENO, CURSOR_HIDE, strlen(CURSOR_HIDE));
+  write(STDOUT_FILENO, CURSOR_HOME, strlen(CURSOR_HOME));
   for (int y = 0; y < win->y; ++y) {
-    for (int x = 0; x < win->x; ++x) {
-      if (win->attribute_map[y][x].dirty == 1) {
-        win->attribute_map[y][x].dirty = 0; // Reset modified map
-        if (win->attribute_map[y][x].color_enabled) {
-          const int fg = color_pairs[win->attribute_map[y][x].color & 0x7f].fg;
-          const int bg = color_pairs[win->attribute_map[y][x].color & 0x7f].bg;
+    // for (int x = 0; x < win->x; ++x) {
+    //   if (win->attribute_map[y][x].dirty == 1) {
+    //     win->attribute_map[y][x].dirty = 0; // Reset modified map
+    //     if (win->attribute_map[y][x].color_enabled) {
+    //       const int fg = color_pairs[win->attribute_map[y][x].color &
+    //       0x7f].fg; const int bg = color_pairs[win->attribute_map[y][x].color
+    //       & 0x7f].bg; printf("\033[%d;%dm", fg + 30, bg + 40);
+    //     } else {
+    //       printf("\033[39m");
+    //     }
 
-          printf("\033[%d;%dm", fg + 30, bg + 40);
-        } else {
-          printf("\033[39m");
-        }
-        printf("\033[%d;%dH%c", y + 1, x + 1, win->lines[y][x]);
-      }
-    }
-    fflush(stdout);
+    //     ++changed;
+    //     printf("\033[%d;%dH%c", y + 1, x + 1, win->lines[y][x]);
+    //   } else if (win->attribute_map[y][x].clear == 1) {
+    //     win->attribute_map[y][x].clear = 0;   // Reset clear map
+    //     printf("\033[%d;%dH ", y + 1, x + 1); // Clear cell
+    //   }
+    win->lines[y][win->x - 1] = '\n'; // Ensure null-termination
+    write(STDOUT_FILENO, win->lines[y], win->x);
+    // printf("\033[%d;%dH%s", y + 1, 1, win->lines[y]);
   }
-
+  fflush(stdout);
   printf("\033[%d;%dH", win->cursor_y, win->cursor_x);
   fflush(stdout);
   if (cursor_enabled) {
-    printf(CURSOR_SHOW);
+    write(STDOUT_FILENO, CURSOR_SHOW, strlen(CURSOR_SHOW));
   }
   fflush(stdout);
 
   return 0;
 }
+
 static int vmvwprintw(WINDOW *win, int y, int x, const char *fmt,
                       va_list args) {
   if (y < 0 || y >= win->y || x < 0 || x >= win->x) {
@@ -410,8 +419,9 @@ int wclear(WINDOW *win) {
   for (int y = 0; y < win->y; ++y) {
     for (int x = 0; x < win->x; ++x) {
       if (win->lines[y][x] != ' ') {
-        win->lines[y][x] = ' ';
-        set_cell_dirty(win, y, x);
+        // win->lines[y][x] = ' ';
+        // set_cell_dirty(win, y, x);
+        win->attribute_map[y][x].clear = 1;
       }
     }
   }
@@ -427,5 +437,13 @@ int raw(void) {
   current_stdin_termios.c_lflag &= ~(ICANON | ECHO);
   tcsetattr(STDOUT_FILENO, TCSAFLUSH, &current_stdout_termios);
   tcsetattr(STDIN_FILENO, TCSAFLUSH, &current_stdin_termios);
+  return 0;
+}
+
+int wclrtoeol(WINDOW *win) {
+  for (int x = win->cursor_x - 1; x < win->x; ++x) {
+    win->lines[win->cursor_y - 1][x] = ' ';
+    set_cell_dirty(win, win->cursor_y - 1, x);
+  }
   return 0;
 }
