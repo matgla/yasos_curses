@@ -59,12 +59,6 @@ typedef struct {
 typedef struct {
   int x;
   int y;
-  int cursor_x;
-  int cursor_y;
-  char **lines;
-  char *line_buffer;
-  Attribute current_attribute;
-  Attribute **attribute_map;
 } WINDOW;
 
 WINDOW *initscr(void);
@@ -83,9 +77,15 @@ int mvaddch(int y, int x, const char ch);
 int mvwaddch(WINDOW *win, int y, int x, const char ch);
 int mvwprintw(WINDOW *win, int y, int x, const char *fmt, ...);
 int mvprintw(int y, int x, const char *fmt, ...);
-int mvaddstr(int y, int x, const char *str);
-int mvaddnstr(int y, int x, const char *str, int n);
-int move(int y, int x);
+int mvwaddnstr(WINDOW *win, int y, int x, const char *str, int n);
+
+#define mvaddnstr(y, x, str, n) mvwaddnstr(stdscr, y, x, str, n)
+
+int mvwaddstr(WINDOW *win, int y, int x, const char *str);
+#define mvaddstr(y, _x, str) mvwaddstr(stdscr, y, _x, str)
+
+int wmove(WINDOW *win, int y, int x);
+#define move(y, x) wmove(stdscr, y, x)
 int attron(int attr);
 int attroff(int attr);
 int wattron(WINDOW *win, int attr);

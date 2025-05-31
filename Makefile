@@ -1,5 +1,5 @@
 CC ?= gcc
-CFLAGS = -std=c11 -Wall -g -fPIC -pedantic -Wextra 
+CFLAGS = -std=gnu11 -Wall -g -fPIC -pedantic -Wextra 
 LDFLAGS_STATIC = -g 
 LDFLAGS = -shared -fPIC
 

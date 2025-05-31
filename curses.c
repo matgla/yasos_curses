@@ -22,17 +22,37 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include <termios.h>
 #include <unistd.h>
 
 #define CLEAR_SCREEN "\033[2J"
+#define CLEAR_SCREEN_LEN 4
+#define CLEAR_TO_EOL "\033[K"
+#define CLEAR_TO_EOL_LEN 3
+
 #define CURSOR_HIDE "\033[?25l"
+#define CURSOR_HIDE_LEN 6
 #define CURSOR_SHOW "\033[?25h"
+#define CURSOR_SHOW_LEN 6
 #define CURSOR_HOME "\033[H"
+#define CURSOR_HOME_LEN 3
+
 #define RESET_STYLE "\033[0m"
-#define CURSOR_SAVE "\0337"
-#define CURSOR_RESTORE "\0338"
+#define RESET_STYLE_LEN 4
+#define RESET_COLOR_STYLE "\033[39;49m"
+#define RESET_COLOR_STYLE_LEN 8
+
+#define BOLD_MODE_ON "\033[1m"
+#define BOLD_MODE_ON_LEN 4
+#define BOLD_MODE_OFF "\033[22m"
+#define BOLD_MODE_OFF_LEN 5
+
+#define ITALIC_MODE_ON "\033[3m"
+#define ITALIC_MODE_ON_LEN 4
+#define ITALIC_MODE_OFF "\033[23m"
+#define ITALIC_MODE_OFF_LEN 5
 
 #define COLOR_ATTRIBUTE (1 << 7)
 
@@ -54,11 +74,28 @@ typedef struct {
 
 ColorPair color_pairs[16] = {0};
 
-static void set_cell_dirty(WINDOW *win, int y, int x) {
-  win->attribute_map[y][x] = win->current_attribute;
-  win->attribute_map[y][x].dirty = 1;
-  win->attribute_map[y][x].clear = 0;
+#ifdef __GNUC__
+char *itoa(int n, char *s, int base) {
+  char *p = s;
+  int sign = n < 0 ? -1 : 1;
+  if (sign < 0)
+    n = -n;
+  do {
+    *p++ = "0123456789abcdef"[n % base];
+    n /= base;
+  } while (n);
+  if (sign < 0)
+    *p++ = '-';
+  *p-- = '\0';
+  while (s < p) {
+    char tmp = *s;
+    *s++ = *p;
+    *p-- = tmp;
+  }
+  return s;
 }
+
+#endif
 
 void getmaxyx_(WINDOW *win, int *y, int *x) {
   if (y != NULL) {
@@ -101,9 +138,9 @@ int noecho(void) {
 int curs_set(int visibility) {
   cursor_enabled = visibility;
   if (visibility == 0) {
-    printf(CURSOR_HIDE);
+    write(STDOUT_FILENO, CURSOR_HIDE, CURSOR_HIDE_LEN);
   } else if (visibility == 1) {
-    printf(CURSOR_SHOW);
+    write(STDOUT_FILENO, CURSOR_SHOW, CURSOR_SHOW_LEN);
   } else {
     return -1;
   }
@@ -113,17 +150,26 @@ int curs_set(int visibility) {
 int nodelay(WINDOW *win, int bf) {
   (void)win;
   (void)bf;
-  current_fcntl_flags = current_fcntl_flags | O_NONBLOCK;
-  fcntl(STDIN_FILENO, F_SETFL, &current_fcntl_flags);
+  current_fcntl_flags = fcntl(STDIN_FILENO, F_GETFL) | O_NONBLOCK;
+  fcntl(STDIN_FILENO, F_SETFL, current_fcntl_flags);
   return 0;
 }
 
 int getch(void) {
   int ch = 0;
-  read(STDIN_FILENO, &ch, 1);
+  int readed = read(STDIN_FILENO, &ch, 1);
+  int i = 0;
+  if (readed <= 0) {
+    return -1;
+  }
   if (ch == 0x1B) {
     char seq = 0;
     while (read(STDIN_FILENO, &seq, 1) == 0) {
+      struct timespec remaining, request = {0, 1000000};
+      nanosleep(&request, &remaining);
+      if (i++ > 10) {
+        return ch;
+      }
     }
     if (seq != '[') {
       return ch;
@@ -153,16 +199,16 @@ int getch(void) {
   return ch;
 }
 
+int waddch(WINDOW *win, const char ch) {
+  return write(STDOUT_FILENO, &ch, 1);
+}
+
 int mvwaddch(WINDOW *win, int y, int x, const char ch) {
   if (y < 0 || y >= win->y || x < 0 || x >= win->x) {
     return -1; // Out of bounds
   }
-  // printf("\033[%d;%dH", y, x);
-  win->cursor_x = x + 2;
-  win->cursor_y = y + 1;
-
-  win->lines[y][x] = ch;
-  set_cell_dirty(win, y, x);
+  wmove(win, y, x); // Move cursor to the specified position
+  waddch(win, ch);  // Add the character at the current cursor position
   return 0;
 }
 
@@ -170,31 +216,49 @@ int mvaddch(int y, int x, const char ch) {
   return mvwaddch(stdscr, y, x, ch);
 }
 
+static int write_color_code(int color_pair) {
+  char buffer[32];
+  if (color_pair < 0 || color_pair > 15) {
+    return -1; // Invalid color pair
+  }
+  const ColorPair pair = color_pairs[color_pair];
+  if (pair.fg < 0 || pair.fg > 15 || pair.bg < 0 || pair.bg > 15) {
+    return -1; // Invalid color
+  }
+  buffer[0] = '\e'; // ESC
+  buffer[1] = '[';
+  char *ptr = buffer + 2;
+  itoa(pair.fg + 30, ptr, 10); // Foreground color
+  ptr += strlen(ptr);
+  *ptr++ = ';';
+  itoa(pair.bg + 40, ptr, 10); // Background color
+  return write(STDOUT_FILENO, buffer, strlen(ptr));
+}
+
 int wattron(WINDOW *win, int attr) {
-  if (attr & A_ITALIC) {
-    win->current_attribute.italic = 1;
-  }
-  if (attr & A_BOLD) {
-    win->current_attribute.bold = 1;
-  }
-  if (attr & COLOR_ATTRIBUTE) {
-    win->current_attribute.color = attr & 0x7f; // Store color pair
-    win->current_attribute.color_enabled = 1;
-  }
+  // if (attr & A_ITALIC) {
+  //   write(STDOUT_FILENO, ITALIC_MODE_ON, ITALIC_MODE_ON_LEN);
+  // }
+  // if (attr & A_BOLD) {
+  //   write(STDOUT_FILENO, BOLD_MODE_ON, BOLD_MODE_ON_LEN);
+  // }
+  // if (attr & COLOR_ATTRIBUTE) {
+  //   const int color_pair = attr & 0x7f; // Extract color pair
+  //   write_color_code(color_pair);
+  // }
   return 0;
 }
 
 int wattroff(WINDOW *win, int attr) {
-  if (attr & A_ITALIC) {
-    win->current_attribute.italic = 0;
-  }
-  if (attr & A_BOLD) {
-    win->current_attribute.bold = 0;
-  }
-  if (attr & COLOR_ATTRIBUTE) {
-    win->current_attribute.color_enabled = 0;
-    win->current_attribute.color = 0;
-  }
+  // if (attr & A_ITALIC) {
+  //   write(STDOUT_FILENO, ITALIC_MODE_OFF, ITALIC_MODE_OFF_LEN);
+  // }
+  // if (attr & A_BOLD) {
+  //   write(STDOUT_FILENO, BOLD_MODE_OFF, BOLD_MODE_OFF_LEN);
+  // }
+  // if (attr & COLOR_ATTRIBUTE) {
+  //   write(STDOUT_FILENO, RESET_COLOR_STYLE, RESET_COLOR_STYLE_LEN);
+  // }
 
   return 0;
 }
@@ -229,13 +293,6 @@ int keypad(WINDOW *win, int bf) {
 
 int wendwin(WINDOW *win) {
   if (win != NULL) {
-    for (int i = 0; i < win->y; ++i) {
-      free(win->lines[i]);
-      free(win->attribute_map[i]);
-    }
-    free(win->lines);
-    free(win->line_buffer);
-    free(win->attribute_map);
     free(win);
   }
   return 0;
@@ -245,10 +302,9 @@ int endwin(void) {
   tcsetattr(STDOUT_FILENO, TCSAFLUSH, &original_stdout_termios);
   tcsetattr(STDIN_FILENO, TCSAFLUSH, &original_stdin_termios);
   fcntl(STDIN_FILENO, F_SETFL, &original_fcntl_flags);
-  printf(CLEAR_SCREEN);
-  printf(CURSOR_SHOW);
-  printf(RESET_STYLE);
-  fflush(stdout);
+  write(STDOUT_FILENO, CLEAR_SCREEN, CLEAR_SCREEN_LEN);
+  write(STDOUT_FILENO, CURSOR_SHOW, CURSOR_SHOW_LEN);
+  write(STDOUT_FILENO, RESET_STYLE, RESET_STYLE_LEN);
   wendwin(stdscr);
   stdscr = NULL;
   return 0;
@@ -264,20 +320,6 @@ WINDOW *newwin(int nlines, int ncols, int begin_y, int begin_x) {
   WINDOW *win = malloc(sizeof(WINDOW));
   win->x = ncols;
   win->y = nlines;
-  win->cursor_x = 1;
-  win->cursor_y = 1;
-  win->line_buffer = malloc(sizeof(char) * (win->x + 1));
-  win->lines = malloc(sizeof(char *) * win->y);
-  for (int i = 0; i < win->y; ++i) {
-    win->lines[i] = malloc(sizeof(char) * (win->x));
-    memset(win->lines[i], ' ', win->x);
-  }
-
-  win->attribute_map = malloc(sizeof(Attribute *) * win->y);
-  for (int i = 0; i < win->y; ++i) {
-    win->attribute_map[i] = malloc(sizeof(Attribute) * (win->x));
-    memset(win->attribute_map[i], 0, sizeof(Attribute) * win->x);
-  }
   return win;
 }
 
@@ -293,8 +335,7 @@ WINDOW *initscr(void) {
   current_stdout_termios = original_stdout_termios;
   current_stdin_termios = original_stdin_termios;
 
-  printf(CLEAR_SCREEN);
-  fflush(stdout);
+  write(STDOUT_FILENO, CLEAR_SCREEN, CLEAR_SCREEN_LEN);
 
   return stdscr;
 }
@@ -312,62 +353,16 @@ int box(WINDOW *win, int verch, int horch) {
 }
 
 int wrefresh(WINDOW *win) {
-  write(STDOUT_FILENO, CURSOR_HIDE, strlen(CURSOR_HIDE));
-  write(STDOUT_FILENO, CURSOR_HOME, strlen(CURSOR_HOME));
-  for (int y = 0; y < win->y; ++y) {
-    // for (int x = 0; x < win->x; ++x) {
-    //   if (win->attribute_map[y][x].dirty == 1) {
-    //     win->attribute_map[y][x].dirty = 0; // Reset modified map
-    //     if (win->attribute_map[y][x].color_enabled) {
-    //       const int fg = color_pairs[win->attribute_map[y][x].color &
-    //       0x7f].fg; const int bg = color_pairs[win->attribute_map[y][x].color
-    //       & 0x7f].bg; printf("\033[%d;%dm", fg + 30, bg + 40);
-    //     } else {
-    //       printf("\033[39m");
-    //     }
-
-    //     ++changed;
-    //     printf("\033[%d;%dH%c", y + 1, x + 1, win->lines[y][x]);
-    //   } else if (win->attribute_map[y][x].clear == 1) {
-    //     win->attribute_map[y][x].clear = 0;   // Reset clear map
-    //     printf("\033[%d;%dH ", y + 1, x + 1); // Clear cell
-    //   }
-    win->lines[y][win->x - 1] = '\n'; // Ensure null-termination
-    write(STDOUT_FILENO, win->lines[y], win->x);
-    // printf("\033[%d;%dH%s", y + 1, 1, win->lines[y]);
-  }
-  fflush(stdout);
-  printf("\033[%d;%dH", win->cursor_y, win->cursor_x);
-  fflush(stdout);
-  if (cursor_enabled) {
-    write(STDOUT_FILENO, CURSOR_SHOW, strlen(CURSOR_SHOW));
-  }
-  fflush(stdout);
-
+  // refresh buffer after buffering implementation on terminal side
   return 0;
-}
-
-static int vmvwprintw(WINDOW *win, int y, int x, const char *fmt,
-                      va_list args) {
-  if (y < 0 || y >= win->y || x < 0 || x >= win->x) {
-    return -1; // Out of bounds
-  }
-
-  int changed = vsnprintf(win->line_buffer, win->x - x, fmt, args);
-  memcpy(win->lines[y] + x, win->line_buffer, changed); // without 0 at end
-  for (int i = 0; i < changed; ++i) {
-    set_cell_dirty(win, y, x + i);
-  }
-
-  win->cursor_x = x + changed + 1;
-  win->cursor_y = y + 1;
-  return changed;
 }
 
 int mvwprintw(WINDOW *win, int y, int x, const char *fmt, ...) {
   va_list args;
   va_start(args, fmt);
-  vmvwprintw(win, y, x, fmt, args);
+  wmove(win, y, x);
+  vprintf(fmt, args);
+  fflush(stdout);
   va_end(args);
   return 0;
 }
@@ -375,56 +370,56 @@ int mvwprintw(WINDOW *win, int y, int x, const char *fmt, ...) {
 int mvprintw(int y, int x, const char *fmt, ...) {
   va_list args;
   va_start(args, fmt);
-  vmvwprintw(stdscr, y, x, fmt, args);
+  move(y, x);
+  int ret = vprintf(fmt, args);
+  fflush(stdout);
   va_end(args);
-  return 0;
+  return ret;
 }
 
 int mvwaddnstr(WINDOW *win, int y, int x, const char *str, int n) {
-  for (int i = 0; i < n; ++i) {
-    if (str[i] == '\0') {
-      break; // Stop if we reach the end of the string or the window width
-    }
-    mvwaddch(win, y, x + i, str[i]);
+  int len = strnlen(str, n);
+  if (len + x > win->x) {
+    len = win->x - x;
   }
-  return 0;
+  wmove(win, y, x);
+  write(STDOUT_FILENO, str, len);
+  return len;
 }
 
-int mvaddnstr(int y, int x, const char *str, int n) {
-  return mvwaddnstr(stdscr, y, x, str, n);
-}
-
-int mvaddstr(int y, int x, const char *str) {
-  return mvwaddnstr(stdscr, y, x, str, stdscr->x - x);
+int mvwaddstr(WINDOW *win, int y, int x, const char *str) {
+  const int len = strlen(str);
+  wmove(win, y, x);
+  write(STDERR_FILENO, str, len);
+  return len;
 }
 
 int wmove(WINDOW *win, int y, int x) {
   if (y < 0 || y >= win->y || x < 0 || x >= win->x) {
     return -1; // Out of bounds
   }
-  win->cursor_x = x + 1;
-  win->cursor_y = y + 1;
-  // printf("\033[%d;%dH", win->cursor_y, win->cursor_x);
+  char buffer[64];
+  buffer[0] = '\e';
+  buffer[1] = '[';
+  char *ptr = buffer + 2;
+  itoa(y + 1, buffer + 2, 10);
+  ptr += strlen(ptr);
+  *ptr++ = ';';
+  itoa(x + 1, ptr, 10);
+  ptr += strlen(ptr);
+  const int len = strlen(buffer);
+  *ptr++ = 'H';
+
+  write(STDOUT_FILENO, buffer, len + 1);
+  fsync(STDOUT_FILENO);
+  // printf("X[%d;%dH", y + 1, x + 1); // Move cursor to (y, x)
   // fflush(stdout);
   return 0;
 }
 
-int move(int y, int x) {
-  return wmove(stdscr, y, x);
-}
-
 int wclear(WINDOW *win) {
-  win->cursor_x = 1;
-  win->cursor_y = 1;
-  for (int y = 0; y < win->y; ++y) {
-    for (int x = 0; x < win->x; ++x) {
-      if (win->lines[y][x] != ' ') {
-        // win->lines[y][x] = ' ';
-        // set_cell_dirty(win, y, x);
-        win->attribute_map[y][x].clear = 1;
-      }
-    }
-  }
+  // TODO: erase only window content
+  write(STDOUT_FILENO, CLEAR_SCREEN, strlen(CLEAR_SCREEN));
   return 0;
 }
 
@@ -441,9 +436,6 @@ int raw(void) {
 }
 
 int wclrtoeol(WINDOW *win) {
-  for (int x = win->cursor_x - 1; x < win->x; ++x) {
-    win->lines[win->cursor_y - 1][x] = ' ';
-    set_cell_dirty(win, win->cursor_y - 1, x);
-  }
+  write(STDOUT_FILENO, CLEAR_TO_EOL, CLEAR_TO_EOL_LEN);
   return 0;
 }
