@@ -430,8 +430,8 @@ int clear(void) {
 int raw(void) {
   current_stdout_termios.c_lflag &= ~(ICANON | ECHO);
   current_stdin_termios.c_lflag &= ~(ICANON | ECHO);
-  tcsetattr(STDOUT_FILENO, TCSAFLUSH, &current_stdout_termios);
-  tcsetattr(STDIN_FILENO, TCSAFLUSH, &current_stdin_termios);
+  tcsetattr(STDOUT_FILENO, TCSANOW, &current_stdout_termios);
+  tcsetattr(STDIN_FILENO, TCSANOW, &current_stdin_termios);
   return 0;
 }
 
