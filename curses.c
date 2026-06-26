@@ -156,12 +156,30 @@ int nodelay(WINDOW *win, int bf) {
 }
 
 int getch(void) {
+  static int swallow_lf = 0;
   int ch = 0;
   int readed = read(STDIN_FILENO, &ch, 1);
   int i = 0;
   if (readed <= 0) {
     return -1;
   }
+  // Normalize Enter across terminals to a single '\n'. In raw mode CR and LF
+  // arrive unmodified, so a CRLF is two bytes; map CR to '\n' and swallow the
+  // LF that immediately follows it, so one keypress is one line break whether
+  // the terminal sends CR, LF or CRLF. The flag survives across calls (the LF
+  // may arrive on a later non-blocking read) and is reset by any other byte.
+  if (ch == '\r') {
+    swallow_lf = 1;
+    return '\n';
+  }
+  if (ch == '\n') {
+    if (swallow_lf) {
+      swallow_lf = 0;
+      return getch();  // drop the LF half of a CRLF; fetch the next key
+    }
+    return '\n';
+  }
+  swallow_lf = 0;
   if (ch == 0x1B) {
     char seq = 0;
     while (read(STDIN_FILENO, &seq, 1) == 0) {
@@ -301,7 +319,7 @@ int wendwin(WINDOW *win) {
 int endwin(void) {
   tcsetattr(STDOUT_FILENO, TCSAFLUSH, &original_stdout_termios);
   tcsetattr(STDIN_FILENO, TCSAFLUSH, &original_stdin_termios);
-  fcntl(STDIN_FILENO, F_SETFL, &original_fcntl_flags);
+  fcntl(STDIN_FILENO, F_SETFL, original_fcntl_flags);
   write(STDOUT_FILENO, CLEAR_SCREEN, CLEAR_SCREEN_LEN);
   write(STDOUT_FILENO, CURSOR_SHOW, CURSOR_SHOW_LEN);
   write(STDOUT_FILENO, RESET_STYLE, RESET_STYLE_LEN);
@@ -323,6 +341,74 @@ WINDOW *newwin(int nlines, int ncols, int begin_y, int begin_x) {
   return win;
 }
 
+// Detect the real terminal size over a serial line via the Cursor Position
+// Report handshake: park the cursor at the far bottom-right (the terminal
+// clamps the move to its actual extent), ask for the cursor position with
+// ESC[6n, and parse the ESC[<rows>;<cols>R reply. A raw serial line carries no
+// size and the kernel's TIOCGWINSZ is hardcoded, so this is the only way to
+// learn the geometry. Updates stdscr on success and leaves it untouched when
+// the terminal doesn't answer (dumb pipe / no CPR support) -- callers keep the
+// 24x80 default. Needs raw, non-blocking input, set up and restored here.
+static void detect_terminal_size(void) {
+  struct termios saved, raw_mode;
+  if (tcgetattr(STDIN_FILENO, &saved) != 0) {
+    return;
+  }
+  raw_mode = saved;
+  raw_mode.c_lflag &= ~(ICANON | ECHO);
+  raw_mode.c_oflag = 0;  // kernel "raw" mode: deliver the reply bytes verbatim
+  raw_mode.c_iflag &= ~(ICRNL | INLCR | IGNCR);
+  tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw_mode);
+  int saved_flags = fcntl(STDIN_FILENO, F_GETFL);
+  fcntl(STDIN_FILENO, F_SETFL, saved_flags | O_NONBLOCK);
+
+  static const char query[] = "\033[999;999H\033[6n";
+  write(STDOUT_FILENO, query, sizeof(query) - 1);
+
+  char buf[32];
+  int n = 0;
+  // Poll up to ~250ms; stop as soon as the reply terminator 'R' arrives.
+  for (int tries = 0; tries < 250 && n < (int)sizeof(buf) - 1; ++tries) {
+    char c;
+    if (read(STDIN_FILENO, &c, 1) == 1) {
+      buf[n++] = c;
+      if (c == 'R') {
+        break;
+      }
+    } else {
+      struct timespec req = {0, 1000000};  // 1ms
+      nanosleep(&req, NULL);
+    }
+  }
+  buf[n] = '\0';
+
+  fcntl(STDIN_FILENO, F_SETFL, saved_flags);
+  tcsetattr(STDIN_FILENO, TCSAFLUSH, &saved);
+
+  // Parse "ESC [ rows ; cols R".
+  int rows = 0, cols = 0;
+  const char *p = buf;
+  while (*p && *p != '\033') {
+    p++;
+  }
+  if (p[0] == '\033' && p[1] == '[') {
+    p += 2;
+    while (*p >= '0' && *p <= '9') {
+      rows = rows * 10 + (*p++ - '0');
+    }
+    if (*p == ';') {
+      p++;
+      while (*p >= '0' && *p <= '9') {
+        cols = cols * 10 + (*p++ - '0');
+      }
+    }
+  }
+  if (rows >= 2 && rows <= 1000 && cols >= 2 && cols <= 1000) {
+    stdscr->y = rows;
+    stdscr->x = cols;
+  }
+}
+
 WINDOW *initscr(void) {
   if (stdscr != NULL) {
     endwin(); // Clean up previous window
@@ -330,12 +416,14 @@ WINDOW *initscr(void) {
   stdscr = newwin(24, 80, 0, 0);
   tcgetattr(STDOUT_FILENO, &original_stdout_termios);
   tcgetattr(STDIN_FILENO, &original_stdin_termios);
-  original_fcntl_flags = fcntl(STDIN_FILENO, F_GETFL, &original_fcntl_flags);
+  original_fcntl_flags = fcntl(STDIN_FILENO, F_GETFL);
 
   current_stdout_termios = original_stdout_termios;
   current_stdin_termios = original_stdin_termios;
 
   write(STDOUT_FILENO, CLEAR_SCREEN, CLEAR_SCREEN_LEN);
+  detect_terminal_size();
+  write(STDOUT_FILENO, CURSOR_HOME, CURSOR_HOME_LEN);
 
   return stdscr;
 }
@@ -430,6 +518,15 @@ int clear(void) {
 int raw(void) {
   current_stdout_termios.c_lflag &= ~(ICANON | ECHO);
   current_stdin_termios.c_lflag &= ~(ICANON | ECHO);
+  // Enter true raw mode. The yasos UART driver treats c_oflag==0 as "raw" and
+  // otherwise maps CR->NL on input; left non-raw, a CRLF-sending terminal
+  // delivers two newlines per Enter (one extra blank line). Clear c_oflag (and
+  // the CR/NL input maps) so Enter arrives as its raw byte(s) and getch()
+  // normalizes CR / LF / CRLF to a single '\n'. endwin() restores the original
+  // termios, so the shell keeps its cooked output afterwards.
+  current_stdout_termios.c_oflag = 0;
+  current_stdin_termios.c_oflag = 0;
+  current_stdin_termios.c_iflag &= ~(ICRNL | INLCR | IGNCR);
   tcsetattr(STDOUT_FILENO, TCSANOW, &current_stdout_termios);
   tcsetattr(STDIN_FILENO, TCSANOW, &current_stdin_termios);
   return 0;
