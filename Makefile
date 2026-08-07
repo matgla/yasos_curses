@@ -1,6 +1,6 @@
 CC ?= gcc
-CFLAGS = -std=gnu11 -Wall -g -fPIC -pedantic -Wextra 
-LDFLAGS_STATIC = -g 
+CFLAGS = -std=gnu11 -Wall $(ROOTFS_DEBUG_CFLAGS) -fPIC -pedantic -Wextra 
+LDFLAGS_STATIC = $(ROOTFS_DEBUG_CFLAGS)
 LDFLAGS = -shared -fPIC
 
 ifeq ($(CC), armv8m-tcc)
