@@ -36,11 +36,31 @@
 #define KEY_UP 258
 #define KEY_DOWN 259
 #define KEY_BACKSPACE 263
+#define KEY_HOME 262
+#define KEY_DC 330
+#define KEY_IC 331
+#define KEY_NPAGE 338
+#define KEY_PPAGE 339
+#define KEY_END 360
 
+// Attribute bits. The low 8 bits carry a colour pair (7 bits of pair number
+// plus the "a pair is set" flag COLOR_PAIR() adds), so display attributes start
+// at bit 8. attr_t values are what attrset()/attron() take.
 #define A_NORMAL 0
 #define A_ITALIC (1 << 8)
 #define A_BOLD (1 << 9)
 #define A_BRIGHT (1 << 10)
+#define A_DIM (1 << 11)
+#define A_REVERSE (1 << 12)
+#define A_UNDERLINE (1 << 13)
+
+// Line-drawing characters. A serial terminal has no alternate character set
+// here, so these are the ASCII approximations.
+#define ACS_VLINE '|'
+#define ACS_HLINE '-'
+
+typedef uint32_t chtype;
+typedef chtype attr_t;
 
 int start_color(void);
 int init_pair(short pair, short f, short b);
@@ -73,6 +93,8 @@ int noecho(void);
 int curs_set(int visibility);
 int nodelay(WINDOW *win, int bf);
 int getch(void);
+int waddch(WINDOW *win, const char ch);
+#define addch(ch) waddch(stdscr, ch)
 int mvaddch(int y, int x, const char ch);
 int mvwaddch(WINDOW *win, int y, int x, const char ch);
 int mvwprintw(WINDOW *win, int y, int x, const char *fmt, ...);
@@ -88,8 +110,10 @@ int wmove(WINDOW *win, int y, int x);
 #define move(y, x) wmove(stdscr, y, x)
 int attron(int attr);
 int attroff(int attr);
+int attrset(attr_t attrs);
 int wattron(WINDOW *win, int attr);
 int wattroff(WINDOW *win, int attr);
+int wattrset(WINDOW *win, attr_t attrs);
 void refresh(void);
 int napms(int ms);
 int endwin(void);

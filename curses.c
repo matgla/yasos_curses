@@ -72,7 +72,14 @@ typedef struct {
   uint8_t fg : 4;
 } ColorPair;
 
-ColorPair color_pairs[16] = {0};
+#define COLOR_PAIRS_COUNT 16
+ColorPair color_pairs[COLOR_PAIRS_COUNT] = {0};
+
+// Attributes currently active on the terminal. Every attribute change goes
+// through write_attributes(), which emits one SGR sequence for the whole set,
+// so this mirrors what the terminal was last told and lets a redundant
+// attrset() (the editor issues one per drawn token) cost nothing.
+static attr_t current_attributes = A_NORMAL;
 
 #ifdef __GNUC__
 char *itoa(int n, char *s, int base) {
@@ -218,6 +225,7 @@ int getch(void) {
 }
 
 int waddch(WINDOW *win, const char ch) {
+  (void)win;
   return write(STDOUT_FILENO, &ch, 1);
 }
 
@@ -234,51 +242,106 @@ int mvaddch(int y, int x, const char ch) {
   return mvwaddch(stdscr, y, x, ch);
 }
 
-static int write_color_code(int color_pair) {
-  char buffer[32];
-  if (color_pair < 0 || color_pair > 15) {
-    return -1; // Invalid color pair
+#define COLOR_PAIR_MASK (COLOR_ATTRIBUTE - 1)
+
+static char *append_number(char *ptr, unsigned int value) {
+  char digits[8];
+  int n = 0;
+  do {
+    digits[n++] = (char)('0' + (value % 10));
+    value /= 10;
+  } while (value != 0);
+  while (n-- > 0) {
+    *ptr++ = digits[n];
   }
-  const ColorPair pair = color_pairs[color_pair];
-  if (pair.fg < 0 || pair.fg > 15 || pair.bg < 0 || pair.bg > 15) {
-    return -1; // Invalid color
+  return ptr;
+}
+
+// Emit a single SGR sequence describing the whole attribute set. attrset()
+// semantics are "replace, don't add", so the sequence always opens with the
+// reset parameter 0 and then re-states every attribute that is on; one write()
+// per change keeps the serial traffic down compared to a code per attribute.
+static void write_attributes(attr_t attrs) {
+  char buffer[64];
+  char *ptr = buffer;
+  *ptr++ = '\033';
+  *ptr++ = '[';
+  *ptr++ = '0';
+  if (attrs & A_BOLD) {
+    *ptr++ = ';';
+    *ptr++ = '1';
   }
-  buffer[0] = '\e'; // ESC
-  buffer[1] = '[';
-  char *ptr = buffer + 2;
-  itoa(pair.fg + 30, ptr, 10); // Foreground color
-  ptr += strlen(ptr);
-  *ptr++ = ';';
-  itoa(pair.bg + 40, ptr, 10); // Background color
-  return write(STDOUT_FILENO, buffer, strlen(ptr));
+  if (attrs & A_DIM) {
+    *ptr++ = ';';
+    *ptr++ = '2';
+  }
+  if (attrs & A_ITALIC) {
+    *ptr++ = ';';
+    *ptr++ = '3';
+  }
+  if (attrs & A_UNDERLINE) {
+    *ptr++ = ';';
+    *ptr++ = '4';
+  }
+  if (attrs & A_REVERSE) {
+    *ptr++ = ';';
+    *ptr++ = '7';
+  }
+  if (attrs & COLOR_ATTRIBUTE) {
+    const unsigned int pair_index = attrs & COLOR_PAIR_MASK;
+    if (pair_index < COLOR_PAIRS_COUNT) {
+      unsigned int fg = color_pairs[pair_index].fg;
+      const unsigned int bg = color_pairs[pair_index].bg;
+      if (attrs & A_BRIGHT) {
+        fg |= 8;
+      }
+      // 0-7 are the base colours (30-37 / 40-47), 8-15 the bright aixterm
+      // variants (90-97 / 100-107).
+      *ptr++ = ';';
+      ptr = append_number(ptr, fg < 8 ? fg + 30 : fg - 8 + 90);
+      *ptr++ = ';';
+      ptr = append_number(ptr, bg < 8 ? bg + 40 : bg - 8 + 100);
+    }
+  }
+  *ptr++ = 'm';
+  write(STDOUT_FILENO, buffer, (size_t)(ptr - buffer));
+}
+
+static int set_attributes(attr_t attrs) {
+  if (attrs != current_attributes) {
+    current_attributes = attrs;
+    write_attributes(attrs);
+  }
+  return 0;
+}
+
+int wattrset(WINDOW *win, attr_t attrs) {
+  (void)win;
+  return set_attributes(attrs);
+}
+
+int attrset(attr_t attrs) {
+  return wattrset(stdscr, attrs);
 }
 
 int wattron(WINDOW *win, int attr) {
-  // if (attr & A_ITALIC) {
-  //   write(STDOUT_FILENO, ITALIC_MODE_ON, ITALIC_MODE_ON_LEN);
-  // }
-  // if (attr & A_BOLD) {
-  //   write(STDOUT_FILENO, BOLD_MODE_ON, BOLD_MODE_ON_LEN);
-  // }
-  // if (attr & COLOR_ATTRIBUTE) {
-  //   const int color_pair = attr & 0x7f; // Extract color pair
-  //   write_color_code(color_pair);
-  // }
-  return 0;
+  (void)win;
+  attr_t attrs = current_attributes | (attr_t)attr;
+  // A colour pair replaces the active pair; OR-ing the pair numbers together
+  // would name a third, unrelated pair.
+  if ((attr_t)attr & COLOR_ATTRIBUTE) {
+    attrs = (attrs & ~(attr_t)COLOR_PAIR_MASK) | ((attr_t)attr & COLOR_PAIR_MASK);
+  }
+  return set_attributes(attrs);
 }
 
 int wattroff(WINDOW *win, int attr) {
-  // if (attr & A_ITALIC) {
-  //   write(STDOUT_FILENO, ITALIC_MODE_OFF, ITALIC_MODE_OFF_LEN);
-  // }
-  // if (attr & A_BOLD) {
-  //   write(STDOUT_FILENO, BOLD_MODE_OFF, BOLD_MODE_OFF_LEN);
-  // }
-  // if (attr & COLOR_ATTRIBUTE) {
-  //   write(STDOUT_FILENO, RESET_COLOR_STYLE, RESET_COLOR_STYLE_LEN);
-  // }
-
-  return 0;
+  (void)win;
+  attr_t attrs = current_attributes & ~(attr_t)attr;
+  if ((attr_t)attr & COLOR_ATTRIBUTE) {
+    attrs &= ~(attr_t)COLOR_PAIR_MASK; // dropping the pair drops its number too
+  }
+  return set_attributes(attrs);
 }
 
 int attron(int attr) {
@@ -323,6 +386,7 @@ int endwin(void) {
   write(STDOUT_FILENO, CLEAR_SCREEN, CLEAR_SCREEN_LEN);
   write(STDOUT_FILENO, CURSOR_SHOW, CURSOR_SHOW_LEN);
   write(STDOUT_FILENO, RESET_STYLE, RESET_STYLE_LEN);
+  current_attributes = A_NORMAL; // RESET_STYLE just cleared them on the wire
   wendwin(stdscr);
   stdscr = NULL;
   return 0;
@@ -422,6 +486,8 @@ WINDOW *initscr(void) {
   current_stdin_termios = original_stdin_termios;
 
   write(STDOUT_FILENO, CLEAR_SCREEN, CLEAR_SCREEN_LEN);
+  write(STDOUT_FILENO, RESET_STYLE, RESET_STYLE_LEN);
+  current_attributes = A_NORMAL;
   detect_terminal_size();
   write(STDOUT_FILENO, CURSOR_HOME, CURSOR_HOME_LEN);
 
