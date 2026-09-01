@@ -19,6 +19,7 @@
 
 #include <fcntl.h>
 #include <stdarg.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -75,12 +76,6 @@ typedef struct {
 #define COLOR_PAIRS_COUNT 16
 ColorPair color_pairs[COLOR_PAIRS_COUNT] = {0};
 
-// Attributes currently active on the terminal. Every attribute change goes
-// through write_attributes(), which emits one SGR sequence for the whole set,
-// so this mirrors what the terminal was last told and lets a redundant
-// attrset() (the editor issues one per drawn token) cost nothing.
-static attr_t current_attributes = A_NORMAL;
-
 #ifdef __GNUC__
 char *itoa(int n, char *s, int base) {
   char *p = s;
@@ -103,6 +98,372 @@ char *itoa(int n, char *s, int base) {
 }
 
 #endif
+
+/* ------------------------------------------------------------------------ */
+/* Output buffer                                                            */
+/*                                                                          */
+/* Everything this library sends to the terminal is staged here and written  */
+/* in one go. A serial console is the slow part of every draw, and one       */
+/* write() per character (which is what this library used to do) both costs  */
+/* a syscall each and lets the terminal render a half-finished screen.       */
+/* ------------------------------------------------------------------------ */
+
+#define OUTPUT_BUFFER_SIZE 512
+
+static char output_buffer[OUTPUT_BUFFER_SIZE];
+static size_t output_length = 0;
+
+static void output_flush(void) {
+  if (output_length != 0) {
+    write(STDOUT_FILENO, output_buffer, output_length);
+    output_length = 0;
+  }
+}
+
+static void output_char(char c) {
+  if (output_length == OUTPUT_BUFFER_SIZE) {
+    output_flush();
+  }
+  output_buffer[output_length++] = c;
+}
+
+static void output_string(const char *str, size_t len) {
+  for (size_t i = 0; i < len; ++i) {
+    output_char(str[i]);
+  }
+}
+
+/* ------------------------------------------------------------------------ */
+/* Screen buffers                                                           */
+/*                                                                          */
+/* A cell holds the character an application drew plus the attributes that   */
+/* were active when it did. Attributes live in the low 14 bits of attr_t (7  */
+/* bits of colour pair, the "pair is set" flag and the display bits), so a   */
+/* uint16_t carries all of them and keeps a cell at four bytes.              */
+/*                                                                          */
+/* The virtual screen is what the application has drawn since the last       */
+/* refresh; the physical screen is what the terminal is currently showing.   */
+/* refresh() emits the difference and nothing else, so an application that   */
+/* repaints the whole screen on every keystroke -- clearing a status bar and */
+/* painting the same text back over it, say -- costs no terminal traffic at  */
+/* all where the result did not change. That is what stops a redrawn bar     */
+/* from visibly blanking and refilling.                                      */
+/* ------------------------------------------------------------------------ */
+
+// The distinct attribute sets an application actually uses are few -- a colour
+// pair per syntax token, plus bold and dim -- so a cell carries a one-byte
+// index into a table of them rather than the attributes themselves. That keeps
+// the two screen buffers at two bytes a cell, which is worth having on a board
+// with half a megabyte of RAM. Interning happens in attrset(), not per drawn
+// character, so the lookup costs nothing on the hot path.
+#define ATTRIBUTE_TABLE_SIZE 256
+
+static attr_t attribute_table[ATTRIBUTE_TABLE_SIZE] = {A_NORMAL};
+static int attribute_table_used = 1;
+
+static uint8_t attribute_intern(attr_t attrs) {
+  for (int i = 0; i < attribute_table_used; ++i) {
+    if (attribute_table[i] == attrs) {
+      return (uint8_t)i;
+    }
+  }
+  if (attribute_table_used < ATTRIBUTE_TABLE_SIZE) {
+    attribute_table[attribute_table_used] = attrs;
+    return (uint8_t)(attribute_table_used++);
+  }
+  return 0;  // table full: plain text beats mis-coloured text
+}
+
+typedef struct {
+  uint8_t character;
+  uint8_t attributes;
+} Cell;
+
+// The two screens are compared with memcmp, so a cell must not carry padding:
+// uninitialised padding bytes would report changes that are not there.
+_Static_assert(sizeof(Cell) == 2, "a screen cell must be free of padding");
+
+#define BLANK_CHARACTER ' '
+
+/* Repainting this many unchanged cells is cheaper than the cursor-position
+   escape it would take to skip over them, so short gaps inside a changed run
+   are just redrawn. */
+#define CURSOR_MOVE_COST 6
+
+static Cell *virtual_screen = NULL;
+static Cell *physical_screen = NULL;
+static int screen_rows = 0;
+static int screen_columns = 0;
+
+/* Where the next drawing call writes, moved by wmove() and advanced by the
+   character-emitting calls. */
+static int cursor_y = 0;
+static int cursor_x = 0;
+
+/* Where the terminal's own cursor is, or -1 when that is unknown (nothing has
+   been written yet, or the last write left the cursor in the pending-wrap
+   state at the end of a line). */
+static int terminal_y = -1;
+static int terminal_x = -1;
+
+/* The attributes drawing calls stamp into cells (kept both as the value and as
+   its table index), and the SGR state the terminal was last told about. */
+static attr_t pen_attributes = A_NORMAL;
+static uint8_t pen_index = 0;
+static attr_t terminal_attributes = A_NORMAL;
+
+/* Set by clear(): the next refresh erases the terminal before diffing. */
+static bool full_repaint_pending = false;
+
+static Cell blank_cell(void) {
+  Cell cell;
+  cell.character = (uint8_t)BLANK_CHARACTER;
+  cell.attributes = 0;  // entry 0 of the table is always A_NORMAL
+  return cell;
+}
+
+static bool cells_equal(const Cell *a, const Cell *b) {
+  return a->character == b->character && a->attributes == b->attributes;
+}
+
+static void screen_fill(Cell *screen, Cell cell) {
+  const int count = screen_rows * screen_columns;
+  for (int i = 0; i < count; ++i) {
+    screen[i] = cell;
+  }
+}
+
+static void screen_free(void) {
+  free(virtual_screen);
+  free(physical_screen);
+  virtual_screen = NULL;
+  physical_screen = NULL;
+}
+
+// Allocate the two screen buffers. Returns false when there is no memory for
+// them, in which case the drawing calls fall back to painting straight through
+// to the terminal -- correct, just without the "only changed cells" saving.
+static bool screen_allocate(int rows, int columns) {
+  screen_free();
+  screen_rows = rows;
+  screen_columns = columns;
+  const size_t count = (size_t)rows * (size_t)columns;
+  virtual_screen = malloc(count * sizeof(Cell));
+  physical_screen = malloc(count * sizeof(Cell));
+  if (virtual_screen == NULL || physical_screen == NULL) {
+    screen_free();
+    return false;
+  }
+  screen_fill(virtual_screen, blank_cell());
+  screen_fill(physical_screen, blank_cell());
+  return true;
+}
+
+static char *append_number(char *ptr, unsigned int value) {
+  char digits[8];
+  int n = 0;
+  do {
+    digits[n++] = (char)('0' + (value % 10));
+    value /= 10;
+  } while (value != 0);
+  while (n-- > 0) {
+    *ptr++ = digits[n];
+  }
+  return ptr;
+}
+
+static void output_cursor_move(int y, int x) {
+  char sequence[24];
+  char *ptr = sequence;
+  *ptr++ = '\033';
+  *ptr++ = '[';
+  ptr = append_number(ptr, (unsigned int)(y + 1));
+  *ptr++ = ';';
+  ptr = append_number(ptr, (unsigned int)(x + 1));
+  *ptr++ = 'H';
+  output_string(sequence, (size_t)(ptr - sequence));
+  terminal_y = y;
+  terminal_x = x;
+}
+
+// Emit a single SGR sequence describing the whole attribute set. attrset()
+// semantics are "replace, don't add", so the sequence always opens with the
+// reset parameter 0 and then re-states every attribute that is on; one escape
+// per change keeps the serial traffic down compared to a code per attribute.
+static void output_attributes(attr_t attrs) {
+  char buffer[64];
+  char *ptr = buffer;
+  *ptr++ = '\033';
+  *ptr++ = '[';
+  *ptr++ = '0';
+  if (attrs & A_BOLD) {
+    *ptr++ = ';';
+    *ptr++ = '1';
+  }
+  if (attrs & A_DIM) {
+    *ptr++ = ';';
+    *ptr++ = '2';
+  }
+  if (attrs & A_ITALIC) {
+    *ptr++ = ';';
+    *ptr++ = '3';
+  }
+  if (attrs & A_UNDERLINE) {
+    *ptr++ = ';';
+    *ptr++ = '4';
+  }
+  if (attrs & A_REVERSE) {
+    *ptr++ = ';';
+    *ptr++ = '7';
+  }
+  if (attrs & COLOR_ATTRIBUTE) {
+    const unsigned int pair_index = attrs & (COLOR_ATTRIBUTE - 1);
+    if (pair_index < COLOR_PAIRS_COUNT) {
+      unsigned int fg = color_pairs[pair_index].fg;
+      const unsigned int bg = color_pairs[pair_index].bg;
+      if (attrs & A_BRIGHT) {
+        fg |= 8;
+      }
+      // 0-7 are the base colours (30-37 / 40-47), 8-15 the bright aixterm
+      // variants (90-97 / 100-107).
+      *ptr++ = ';';
+      ptr = append_number(ptr, fg < 8 ? fg + 30 : fg - 8 + 90);
+      *ptr++ = ';';
+      ptr = append_number(ptr, bg < 8 ? bg + 40 : bg - 8 + 100);
+    }
+  }
+  *ptr++ = 'm';
+  output_string(buffer, (size_t)(ptr - buffer));
+  terminal_attributes = attrs;
+}
+
+// Stamp one character into the virtual screen. Without the buffers (allocation
+// failed) it goes straight to the terminal, which is what this library did
+// before double buffering.
+static void screen_put(int y, int x, char ch) {
+  if (y < 0 || y >= screen_rows || x < 0 || x >= screen_columns) {
+    return;
+  }
+  if (virtual_screen != NULL) {
+    Cell *cell = &virtual_screen[y * screen_columns + x];
+    cell->character = (uint8_t)ch;
+    cell->attributes = pen_index;
+    return;
+  }
+  if (terminal_y != y || terminal_x != x) {
+    output_cursor_move(y, x);
+  }
+  if (terminal_attributes != pen_attributes) {
+    output_attributes(pen_attributes);
+  }
+  output_char(ch);
+  terminal_x++;
+  output_flush();
+}
+
+static void cursor_advance(void) {
+  if (++cursor_x >= screen_columns) {
+    cursor_x = 0;
+    if (cursor_y + 1 < screen_rows) {
+      cursor_y++;
+    }
+  }
+}
+
+// Paint one row's worth of changed cells, from run_start up to (not including)
+// run_end, and record them as displayed.
+static void screen_emit_run(int y, int run_start, int run_end) {
+  Cell *virtual_row = &virtual_screen[y * screen_columns];
+  Cell *physical_row = &physical_screen[y * screen_columns];
+
+  if (terminal_y != y || terminal_x != run_start) {
+    output_cursor_move(y, run_start);
+  }
+  for (int x = run_start; x < run_end; ++x) {
+    const attr_t attributes = attribute_table[virtual_row[x].attributes];
+    if (attributes != terminal_attributes) {
+      output_attributes(attributes);
+    }
+    output_char((char)virtual_row[x].character);
+    physical_row[x] = virtual_row[x];
+  }
+  terminal_x = run_end;
+  if (terminal_x >= screen_columns) {
+    // The terminal is in the pending-wrap state; the next absolute move
+    // cancels it, but until then its cursor position is not ours to predict.
+    terminal_x = -1;
+    terminal_y = -1;
+  }
+}
+
+// Send the difference between the virtual and physical screens, then park the
+// terminal cursor where the application left it.
+static void screen_update(void) {
+  if (virtual_screen == NULL) {
+    output_flush();
+    return;
+  }
+
+  const size_t screen_bytes =
+      (size_t)screen_rows * (size_t)screen_columns * sizeof(Cell);
+  const bool contents_differ =
+      memcmp(virtual_screen, physical_screen, screen_bytes) != 0;
+  const bool cursor_misplaced =
+      terminal_y != cursor_y || terminal_x != cursor_x;
+
+  if (!full_repaint_pending && !contents_differ && !cursor_misplaced) {
+    return;  // nothing on screen changed: not a single byte goes out
+  }
+
+  // Hide the cursor while painting so it does not visibly run over the screen,
+  // and only when the application wanted it visible in the first place.
+  if (cursor_enabled) {
+    output_string(CURSOR_HIDE, CURSOR_HIDE_LEN);
+  }
+
+  if (full_repaint_pending) {
+    output_attributes(A_NORMAL);
+    output_string(CLEAR_SCREEN, CLEAR_SCREEN_LEN);
+    screen_fill(physical_screen, blank_cell());
+    terminal_y = -1;
+    terminal_x = -1;
+    full_repaint_pending = false;
+  }
+
+  for (int y = 0; y < screen_rows; ++y) {
+    const Cell *virtual_row = &virtual_screen[y * screen_columns];
+    const Cell *physical_row = &physical_screen[y * screen_columns];
+    int x = 0;
+    while (x < screen_columns) {
+      if (cells_equal(&virtual_row[x], &physical_row[x])) {
+        ++x;
+        continue;
+      }
+      // Extend the run past short stretches of unchanged cells: repainting
+      // them costs less than the escape needed to jump over them.
+      int run_end = x + 1;
+      int unchanged = 0;
+      for (int scan = x; scan < screen_columns; ++scan) {
+        if (!cells_equal(&virtual_row[scan], &physical_row[scan])) {
+          run_end = scan + 1;
+          unchanged = 0;
+        } else if (++unchanged > CURSOR_MOVE_COST) {
+          break;
+        }
+      }
+      screen_emit_run(y, x, run_end);
+      x = run_end;
+    }
+  }
+
+  if (terminal_y != cursor_y || terminal_x != cursor_x) {
+    output_cursor_move(cursor_y, cursor_x);
+  }
+  if (cursor_enabled) {
+    output_string(CURSOR_SHOW, CURSOR_SHOW_LEN);
+  }
+  output_flush();
+}
 
 void getmaxyx_(WINDOW *win, int *y, int *x) {
   if (y != NULL) {
@@ -143,13 +504,15 @@ int noecho(void) {
 }
 
 int curs_set(int visibility) {
+  if (visibility != 0 && visibility != 1) {
+    return -1;
+  }
   cursor_enabled = visibility;
+  output_flush();
   if (visibility == 0) {
     write(STDOUT_FILENO, CURSOR_HIDE, CURSOR_HIDE_LEN);
-  } else if (visibility == 1) {
-    write(STDOUT_FILENO, CURSOR_SHOW, CURSOR_SHOW_LEN);
   } else {
-    return -1;
+    write(STDOUT_FILENO, CURSOR_SHOW, CURSOR_SHOW_LEN);
   }
   return 0;
 }
@@ -226,7 +589,9 @@ int getch(void) {
 
 int waddch(WINDOW *win, const char ch) {
   (void)win;
-  return write(STDOUT_FILENO, &ch, 1);
+  screen_put(cursor_y, cursor_x, ch);
+  cursor_advance();
+  return 0;
 }
 
 int mvwaddch(WINDOW *win, int y, int x, const char ch) {
@@ -242,75 +607,10 @@ int mvaddch(int y, int x, const char ch) {
   return mvwaddch(stdscr, y, x, ch);
 }
 
-#define COLOR_PAIR_MASK (COLOR_ATTRIBUTE - 1)
-
-static char *append_number(char *ptr, unsigned int value) {
-  char digits[8];
-  int n = 0;
-  do {
-    digits[n++] = (char)('0' + (value % 10));
-    value /= 10;
-  } while (value != 0);
-  while (n-- > 0) {
-    *ptr++ = digits[n];
-  }
-  return ptr;
-}
-
-// Emit a single SGR sequence describing the whole attribute set. attrset()
-// semantics are "replace, don't add", so the sequence always opens with the
-// reset parameter 0 and then re-states every attribute that is on; one write()
-// per change keeps the serial traffic down compared to a code per attribute.
-static void write_attributes(attr_t attrs) {
-  char buffer[64];
-  char *ptr = buffer;
-  *ptr++ = '\033';
-  *ptr++ = '[';
-  *ptr++ = '0';
-  if (attrs & A_BOLD) {
-    *ptr++ = ';';
-    *ptr++ = '1';
-  }
-  if (attrs & A_DIM) {
-    *ptr++ = ';';
-    *ptr++ = '2';
-  }
-  if (attrs & A_ITALIC) {
-    *ptr++ = ';';
-    *ptr++ = '3';
-  }
-  if (attrs & A_UNDERLINE) {
-    *ptr++ = ';';
-    *ptr++ = '4';
-  }
-  if (attrs & A_REVERSE) {
-    *ptr++ = ';';
-    *ptr++ = '7';
-  }
-  if (attrs & COLOR_ATTRIBUTE) {
-    const unsigned int pair_index = attrs & COLOR_PAIR_MASK;
-    if (pair_index < COLOR_PAIRS_COUNT) {
-      unsigned int fg = color_pairs[pair_index].fg;
-      const unsigned int bg = color_pairs[pair_index].bg;
-      if (attrs & A_BRIGHT) {
-        fg |= 8;
-      }
-      // 0-7 are the base colours (30-37 / 40-47), 8-15 the bright aixterm
-      // variants (90-97 / 100-107).
-      *ptr++ = ';';
-      ptr = append_number(ptr, fg < 8 ? fg + 30 : fg - 8 + 90);
-      *ptr++ = ';';
-      ptr = append_number(ptr, bg < 8 ? bg + 40 : bg - 8 + 100);
-    }
-  }
-  *ptr++ = 'm';
-  write(STDOUT_FILENO, buffer, (size_t)(ptr - buffer));
-}
-
 static int set_attributes(attr_t attrs) {
-  if (attrs != current_attributes) {
-    current_attributes = attrs;
-    write_attributes(attrs);
+  if (attrs != pen_attributes) {
+    pen_attributes = attrs;
+    pen_index = attribute_intern(attrs);
   }
   return 0;
 }
@@ -326,20 +626,22 @@ int attrset(attr_t attrs) {
 
 int wattron(WINDOW *win, int attr) {
   (void)win;
-  attr_t attrs = current_attributes | (attr_t)attr;
+  attr_t attrs = pen_attributes | (attr_t)attr;
   // A colour pair replaces the active pair; OR-ing the pair numbers together
   // would name a third, unrelated pair.
   if ((attr_t)attr & COLOR_ATTRIBUTE) {
-    attrs = (attrs & ~(attr_t)COLOR_PAIR_MASK) | ((attr_t)attr & COLOR_PAIR_MASK);
+    attrs = (attrs & ~(attr_t)(COLOR_ATTRIBUTE - 1)) |
+            ((attr_t)attr & (COLOR_ATTRIBUTE - 1));
   }
   return set_attributes(attrs);
 }
 
 int wattroff(WINDOW *win, int attr) {
   (void)win;
-  attr_t attrs = current_attributes & ~(attr_t)attr;
+  attr_t attrs = pen_attributes & ~(attr_t)attr;
   if ((attr_t)attr & COLOR_ATTRIBUTE) {
-    attrs &= ~(attr_t)COLOR_PAIR_MASK; // dropping the pair drops its number too
+    // dropping the pair drops its number too
+    attrs &= ~(attr_t)(COLOR_ATTRIBUTE - 1);
   }
   return set_attributes(attrs);
 }
@@ -380,13 +682,21 @@ int wendwin(WINDOW *win) {
 }
 
 int endwin(void) {
+  output_flush();
   tcsetattr(STDOUT_FILENO, TCSAFLUSH, &original_stdout_termios);
   tcsetattr(STDIN_FILENO, TCSAFLUSH, &original_stdin_termios);
   fcntl(STDIN_FILENO, F_SETFL, original_fcntl_flags);
   write(STDOUT_FILENO, CLEAR_SCREEN, CLEAR_SCREEN_LEN);
   write(STDOUT_FILENO, CURSOR_SHOW, CURSOR_SHOW_LEN);
   write(STDOUT_FILENO, RESET_STYLE, RESET_STYLE_LEN);
-  current_attributes = A_NORMAL; // RESET_STYLE just cleared them on the wire
+  terminal_attributes = A_NORMAL; // RESET_STYLE just cleared them on the wire
+  pen_attributes = A_NORMAL;
+  pen_index = 0;
+  terminal_y = -1;
+  terminal_x = -1;
+  screen_free();
+  screen_rows = 0;
+  screen_columns = 0;
   wendwin(stdscr);
   stdscr = NULL;
   return 0;
@@ -487,9 +797,24 @@ WINDOW *initscr(void) {
 
   write(STDOUT_FILENO, CLEAR_SCREEN, CLEAR_SCREEN_LEN);
   write(STDOUT_FILENO, RESET_STYLE, RESET_STYLE_LEN);
-  current_attributes = A_NORMAL;
+  attribute_table[0] = A_NORMAL;
+  attribute_table_used = 1;
+  pen_attributes = A_NORMAL;
+  pen_index = 0;
+  terminal_attributes = A_NORMAL;
   detect_terminal_size();
   write(STDOUT_FILENO, CURSOR_HOME, CURSOR_HOME_LEN);
+
+  // The screen was just cleared and the cursor parked at the top left, so both
+  // buffers start out matching what the terminal shows.
+  screen_allocate(stdscr->y, stdscr->x);
+  screen_rows = stdscr->y;
+  screen_columns = stdscr->x;
+  cursor_y = 0;
+  cursor_x = 0;
+  terminal_y = 0;
+  terminal_x = 0;
+  full_repaint_pending = false;
 
   return stdscr;
 }
@@ -507,73 +832,101 @@ int box(WINDOW *win, int verch, int horch) {
 }
 
 int wrefresh(WINDOW *win) {
-  // refresh buffer after buffering implementation on terminal side
+  (void)win;
+  screen_update();
   return 0;
+}
+
+// Common tail of the string-drawing calls: stamp len characters starting at
+// (y, x) and leave the cursor just past them.
+static int screen_add_string(WINDOW *win, int y, int x, const char *str,
+                             int len) {
+  if (len > win->x - x) {
+    len = win->x - x;
+  }
+  if (len < 0) {
+    len = 0;
+  }
+  if (wmove(win, y, x) != 0) {
+    return 0;
+  }
+  for (int i = 0; i < len; ++i) {
+    screen_put(y, x + i, str[i]);
+  }
+  cursor_y = y;
+  cursor_x = x + len;
+  if (cursor_x >= screen_columns) {
+    // Same wrap the character-at-a-time path takes when it runs off the row.
+    cursor_x = 0;
+    if (cursor_y + 1 < screen_rows) {
+      cursor_y++;
+    }
+  }
+  return len;
 }
 
 int mvwprintw(WINDOW *win, int y, int x, const char *fmt, ...) {
+  char buffer[256];
   va_list args;
   va_start(args, fmt);
-  wmove(win, y, x);
-  vprintf(fmt, args);
-  fflush(stdout);
+  int len = vsnprintf(buffer, sizeof(buffer), fmt, args);
   va_end(args);
-  return 0;
+  if (len < 0) {
+    return -1;
+  }
+  if (len > (int)sizeof(buffer) - 1) {
+    len = (int)sizeof(buffer) - 1;
+  }
+  return screen_add_string(win, y, x, buffer, len);
 }
 
 int mvprintw(int y, int x, const char *fmt, ...) {
+  char buffer[256];
   va_list args;
   va_start(args, fmt);
-  move(y, x);
-  int ret = vprintf(fmt, args);
-  fflush(stdout);
+  int len = vsnprintf(buffer, sizeof(buffer), fmt, args);
   va_end(args);
-  return ret;
+  if (len < 0) {
+    return -1;
+  }
+  if (len > (int)sizeof(buffer) - 1) {
+    len = (int)sizeof(buffer) - 1;
+  }
+  return screen_add_string(stdscr, y, x, buffer, len);
 }
 
 int mvwaddnstr(WINDOW *win, int y, int x, const char *str, int n) {
-  int len = strnlen(str, n);
-  if (len + x > win->x) {
-    len = win->x - x;
-  }
-  wmove(win, y, x);
-  write(STDOUT_FILENO, str, len);
-  return len;
+  return screen_add_string(win, y, x, str, (int)strnlen(str, (size_t)n));
 }
 
 int mvwaddstr(WINDOW *win, int y, int x, const char *str) {
-  const int len = strlen(str);
-  wmove(win, y, x);
-  write(STDERR_FILENO, str, len);
-  return len;
+  return screen_add_string(win, y, x, str, (int)strlen(str));
 }
 
 int wmove(WINDOW *win, int y, int x) {
   if (y < 0 || y >= win->y || x < 0 || x >= win->x) {
     return -1; // Out of bounds
   }
-  char buffer[64];
-  buffer[0] = '\e';
-  buffer[1] = '[';
-  char *ptr = buffer + 2;
-  itoa(y + 1, buffer + 2, 10);
-  ptr += strlen(ptr);
-  *ptr++ = ';';
-  itoa(x + 1, ptr, 10);
-  ptr += strlen(ptr);
-  const int len = strlen(buffer);
-  *ptr++ = 'H';
-
-  write(STDOUT_FILENO, buffer, len + 1);
-  fsync(STDOUT_FILENO);
-  // printf("X[%d;%dH", y + 1, x + 1); // Move cursor to (y, x)
-  // fflush(stdout);
+  cursor_y = y;
+  cursor_x = x;
   return 0;
 }
 
 int wclear(WINDOW *win) {
+  (void)win;
   // TODO: erase only window content
-  write(STDOUT_FILENO, CLEAR_SCREEN, strlen(CLEAR_SCREEN));
+  if (virtual_screen != NULL) {
+    screen_fill(virtual_screen, blank_cell());
+  }
+  cursor_y = 0;
+  cursor_x = 0;
+  full_repaint_pending = true;
+  if (virtual_screen == NULL) {
+    output_flush();
+    write(STDOUT_FILENO, CLEAR_SCREEN, CLEAR_SCREEN_LEN);
+    terminal_y = -1;
+    terminal_x = -1;
+  }
   return 0;
 }
 
@@ -599,6 +952,18 @@ int raw(void) {
 }
 
 int wclrtoeol(WINDOW *win) {
-  write(STDOUT_FILENO, CLEAR_TO_EOL, CLEAR_TO_EOL_LEN);
+  (void)win;
+  if (virtual_screen == NULL) {
+    output_flush();
+    write(STDOUT_FILENO, CLEAR_TO_EOL, CLEAR_TO_EOL_LEN);
+    return 0;
+  }
+  if (cursor_y < 0 || cursor_y >= screen_rows) {
+    return 0;
+  }
+  Cell *row = &virtual_screen[cursor_y * screen_columns];
+  for (int x = cursor_x; x < screen_columns; ++x) {
+    row[x] = blank_cell();
+  }
   return 0;
 }

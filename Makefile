@@ -55,5 +55,12 @@ install: $(TARGET_SHARED) $(TARGET_STATIC) $(TARGET_SHARED_ELF)
 
 	cp include/*.h $(INCLUDEDIR)
 
+test:
+	$(MAKE) -C tests test
+
+build_tests:
+	$(MAKE) -C tests build_tests
+
 clean:
 	rm -rf build
+	$(MAKE) -C tests clean
