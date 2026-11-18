@@ -580,8 +580,10 @@ int getch(void) {
       ch = KEY_LEFT;
       break;
     }
-  } else if (ch == 0x08 || ch == 0x7F) {
-    // Handle backspace
+  } else if (ch == 0x7F) {
+    // The Backspace key (DEL, as terminals send it). Ctrl-H (0x08) stays
+    // itself, as with ncurses and terminfo kbs=^?: programs tell the two
+    // apart (yasvi: Ctrl-H moves to the file tree).
     ch = KEY_BACKSPACE;
   }
   return ch;
