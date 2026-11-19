@@ -688,9 +688,12 @@ int endwin(void) {
   tcsetattr(STDOUT_FILENO, TCSAFLUSH, &original_stdout_termios);
   tcsetattr(STDIN_FILENO, TCSAFLUSH, &original_stdin_termios);
   fcntl(STDIN_FILENO, F_SETFL, original_fcntl_flags);
-  write(STDOUT_FILENO, CLEAR_SCREEN, CLEAR_SCREEN_LEN);
-  write(STDOUT_FILENO, CURSOR_SHOW, CURSOR_SHOW_LEN);
-  write(STDOUT_FILENO, RESET_STYLE, RESET_STYLE_LEN);
+  // The style first: a terminal fills what ESC[2J erases with the current
+  // background colour, so clearing under the program's last colour pair left
+  // the shell on that background. Then the cursor goes to the top left, where
+  // the shell's next line starts.
+  static const char leave[] = RESET_STYLE CLEAR_SCREEN CURSOR_HOME CURSOR_SHOW;
+  write(STDOUT_FILENO, leave, sizeof(leave) - 1);
   terminal_attributes = A_NORMAL; // RESET_STYLE just cleared them on the wire
   pen_attributes = A_NORMAL;
   pen_index = 0;

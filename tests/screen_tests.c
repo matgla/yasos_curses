@@ -306,3 +306,31 @@ UTEST(screen, random_draws_leave_the_terminal_matching_what_was_drawn) {
 
   screen_end(&fixture);
 }
+
+// endwin resets the style before it clears: terminals fill an erased screen
+// with the current background colour, so clearing under the program's last
+// colour pair left the shell on vi's background. Then the cursor goes home.
+UTEST(screen, endwin_resets_the_style_before_clearing) {
+  ScreenFixture fixture;
+  screen_begin(&fixture);
+
+  start_color();
+  init_pair(1, COLOR_WHITE, COLOR_BLUE);
+  attrset(COLOR_PAIR(1));
+  mvaddnstr(23, 0, "status", 6);
+  screen_frame(&fixture);
+  EXPECT_TRUE(strstr(fixture.bytes, ";44") != NULL);  // the blue background is on
+
+  endwin();
+  const size_t length =
+      capture_take(&fixture.capture, fixture.bytes, sizeof(fixture.bytes) - 1);
+  fixture.bytes[length] = '\0';
+  capture_end(&fixture.capture);
+
+  const char *reset = strstr(fixture.bytes, "\033[0m");
+  const char *clear = strstr(fixture.bytes, "\033[2J");
+  const char *home = strstr(fixture.bytes, "\033[H");
+  ASSERT_TRUE(reset != NULL && clear != NULL && home != NULL);
+  EXPECT_TRUE(reset < clear);
+  EXPECT_TRUE(clear < home);
+}
